@@ -25,6 +25,7 @@ extern exit
 %define REQ_BUF_CAP     (16 * 1024)
 %define EPOLLIN         0x001
 %define EPOLLET         (1 << 31)
+%define EPOLL_EV_SIZE   12          ; struct epoll_event = 4+8 = 12 bytes
 
 %define SOCK_CLOEXEC    0x80000
 %define SOCK_NONBLOCK   0x800
@@ -124,7 +125,7 @@ vec:        resq VEC_DIM            ; 14 doubles
 mcc_buf:    resb 4                  ; holds parsed MCC
 listen_fd:  resd 1
 epfd:       resd 1
-events:     resb MAX_EVENTS * 16    ; 12 bytes each, padded to 16
+events:     resb MAX_EVENTS * EPOLL_EV_SIZE  ; 12 bytes each
 
 ; Constants for normalize/clamp
 section .data
@@ -202,7 +203,7 @@ main:
   mov  rdi, [epfd]
   mov  esi, 1                     ; EPOLL_CTL_ADD
   mov  edx, dword [listen_fd]
-  lea  r10, [rsp]
+  lea  rcx, [rsp]                 ; FIX bug #1: rcx, not r10
   call epoll_ctl
   add  rsp, 16
 
@@ -214,35 +215,46 @@ main:
   call epoll_wait
   test rax, rax
   jle  .event_loop                 ; rax<0 = interrupted, retry
-  mov  r10, rax                    ; r10 = n
-  xor  r11, r11                    ; r11 = i
+  mov  r12, rax                    ; FIX bug #2: r12 (callee-saved), not r10
+  xor  r13, r13                    ; FIX bug #2: r13, not r11
 
 .handle_each:
-  cmp  r11, r10
+  cmp  r13, r12
   jge  .event_loop
 
-  mov  rax, r11
-  shl  rax, 4                      ; *16 for index into events[]
-  lea  r12, [rel events]
-  add  r12, rax
-  mov  r13d, dword [r12]           ; .events
-  mov  r14d, dword [r12+4]         ; .data.fd
+  mov  rax, r13
+  mov  rcx, EPOLL_EV_SIZE
+  imul rax, rcx                    ; *12 for index into events[]
+  lea  r15, [rel events]            ; FIX bug #2: r15 (callee-saved), not r12
+  add  r15, rax
+  mov  r14d, dword [r15]           ; .events
+  mov  rbx, r14                    ; preserve events in rbx
+  mov  r14d, dword [r15+4]         ; .data.fd
 
   cmp  r14d, dword [listen_fd]
   je   .do_accept
   ; client fd: handle
   mov  edi, r14d
+  push r12
+  push r13
   call handle_client
+  pop  r13
+  pop  r12
   jmp  .next
 
 .do_accept:
   mov  edi, dword [listen_fd]
-  mov  esi, SOCK_CLOEXEC | SOCK_NONBLOCK
-  xor  edx, edx
+  xor  esi, esi                   ; addr=NULL
+  xor  edx, edx                   ; addrlen=0
+  mov  ecx, SOCK_CLOEXEC | SOCK_NONBLOCK  ; flags in rcx
 .accept_retry:
+  push r12
+  push r13
   call accept4
+  pop  r13
+  pop  r12
   cmp  rax, 0
-  jl   .next                       ; EAGAIN or error
+  jle  .next                       ; EAGAIN or error
   mov  ebx, eax
   ; epoll_ctl ADD
   sub  rsp, 16
@@ -252,14 +264,48 @@ main:
   mov  rdi, [epfd]
   mov  esi, 1
   mov  edx, ebx
-  lea  r10, [rsp]
+  lea  rcx, [rsp]                  ; FIX bug #1: rcx, not r10
+  push r12
+  push r13
   call epoll_ctl
+  pop  r13
+  pop  r12
   add  rsp, 16
   jmp  .accept_retry
 
 .next:
-  inc  r11
+  inc  r13
   jmp  .handle_each
+
+; ============================================================
+; handle_client: read request, parse, classify, write response, close
+; rdi = client fd
+; ============================================================
+; Helper: write all bytes (rsi=buf, rdx=len, rdi=fd)
+; Uses syscall directly to avoid register clobbering
+write_all:
+  push rbx
+  push r12
+  mov  r12, rsi
+  mov  rbx, rdx                    ; rbx = remaining
+  mov  r8, rdi                     ; r8 = fd
+.wa_loop:
+  test rbx, rbx
+  jz   .wa_done
+  mov  rax, 1                      ; SYS_write
+  mov  rdi, r8
+  mov  rsi, r12
+  mov  rdx, rbx
+  syscall
+  cmp  rax, 0
+  jle  .wa_done
+  add  r12, rax
+  sub  rbx, rax
+  jmp  .wa_loop
+.wa_done:
+  pop  r12
+  pop  rbx
+  ret
 
 ; ============================================================
 ; handle_client: read request, parse, classify, write response, close
@@ -272,11 +318,12 @@ handle_client:
   push r15
   mov  r15, rdi
 
+  ; Use raw syscall read to avoid register clobbering
+  mov  rax, 0                      ; SYS_read
   mov  rdi, r15
   lea  rsi, [rel req_buf]
   mov  rdx, REQ_BUF_CAP
-  xor  rax, rax
-  call read
+  syscall
   cmp  rax, 1
   jle  .hc_close                   ; 0 = EOF, -1 = err
   mov  r12, rax                    ; r12 = bytes read
@@ -289,11 +336,10 @@ handle_client:
   jmp  .hc_404
 
 .hc_get:
-  ; Match path /ready (simplest always-OK)
   mov  rdi, r15
   lea  rsi, [rel resp_ready]
   mov  rdx, resp_ready_len
-  call write
+  call write_all
   jmp  .hc_close
 
 .hc_post:
@@ -309,26 +355,25 @@ handle_client:
   ; Classify
   lea  rdi, [rel vec]
   call classify
-  ; rax = 0 legit, 1 fraud
   test rax, rax
   jnz  .hc_fraud
 .hc_legit:
   mov  rdi, r15
   lea  rsi, [rel resp_approved_true]
   mov  rdx, resp_approved_true_len
-  call write
+  call write_all
   jmp  .hc_close
 .hc_fraud:
   mov  rdi, r15
   lea  rsi, [rel resp_approved_false]
   mov  rdx, resp_approved_false_len
-  call write
+  call write_all
   jmp  .hc_close
 .hc_404:
   mov  rdi, r15
   lea  rsi, [rel resp_notfound]
   mov  rdx, resp_notfound_len
-  call write
+  call write_all
 .hc_close:
   mov  rdi, r15
   call close
