@@ -1,0 +1,54 @@
+version: "3.8"
+
+services:
+  api1:
+    build:
+      context: ./asm-src
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    image: rinha-asm:c-local
+    platform: linux/amd64
+    container_name: api1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "140MB"
+    networks:
+      - fraud-net
+
+  api2:
+    image: rinha-asm:c-local
+    platform: linux/amd64
+    container_name: api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "140MB"
+    networks:
+      - fraud-net
+
+  nginx:
+    image: nginx:stable
+    platform: linux/amd64
+    container_name: nginx
+    ports:
+      - "19998:9999"
+    volumes:
+      - ./nginx-asm.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "70MB"
+    networks:
+      - fraud-net
+    depends_on:
+      - api1
+      - api2
+
+networks:
+  fraud-net:
+    driver: bridge
